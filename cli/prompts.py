@@ -221,6 +221,11 @@ _OPENROUTER_MAINSTREAM = {
 }
 
 
+def _prefer_openrouter_free_models(models: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Keep free OpenRouter models first while preserving API ordering within each group."""
+    return sorted(models, key=lambda model: not model[1].endswith(":free"))
+
+
 def _fetch_openrouter_models() -> list[tuple[str, str]]:
     """Fetch available models from the OpenRouter API."""
     import requests
