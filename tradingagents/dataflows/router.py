@@ -6,6 +6,10 @@ from tradingagents.dataflows.errors import (
     VendorNotConfiguredError,
     VendorUnavailableError,
 )
+from tradingagents.dataflows.vendors.agentfeed import (
+    get_crypto_derivatives as get_agentfeed_crypto_derivatives,
+    is_configured as agentfeed_is_configured,
+)
 from tradingagents.dataflows.vendors.alpha_vantage import (
     get_balance_sheet as get_alpha_vantage_balance_sheet,
     get_cashflow as get_alpha_vantage_cashflow,
@@ -83,15 +87,22 @@ TOOLS_CATEGORIES = {
         "tools": [
             "get_prediction_markets",
         ]
+    },
+    "crypto_derivatives": {
+        "description": "Perpetual-futures context for crypto tickers: funding, open interest, liquidation clusters, large positions",
+        "tools": [
+            "get_crypto_derivatives",
+        ]
     }
 }
 
 # Optional enrichment categories. These add macro/event context to the news
-# analyst but are not core to a decision, so a vendor failure here degrades to a
+# analyst, and perpetual-futures positioning to a crypto run's market analyst,
+# but are not core to a decision, so a vendor failure here degrades to a
 # sentinel instead of aborting the run (a bad LLM-supplied indicator, a missing
 # key, or a network blip should not crash an analysis over flavour data). Core
 # categories (prices, fundamentals, news) still raise so a broken primary is loud.
-OPTIONAL_CATEGORIES = {"macro_data", "prediction_markets"}
+OPTIONAL_CATEGORIES = {"macro_data", "prediction_markets", "crypto_derivatives"}
 
 # Mapping of methods to their vendor-specific implementations
 VENDOR_METHODS = {
@@ -146,6 +157,10 @@ VENDOR_METHODS = {
     "get_prediction_markets": {
         "polymarket": get_polymarket_prediction_markets,
     },
+    # crypto_derivatives
+    "get_crypto_derivatives": {
+        "agentfeed": get_agentfeed_crypto_derivatives,
+    },
 }
 
 
@@ -171,6 +186,18 @@ def get_vendor(category: str, method: str = None) -> str:
 
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
+
+
+def crypto_derivatives_available() -> bool:
+    """Whether a crypto run is offered get_crypto_derivatives at all.
+
+    Only when AgentFeed is in the configured chain (an explicit list naming it, or
+    "default") and its key is set. Otherwise the tool and its brief are left out,
+    so a crypto run without the key sees exactly what it saw before.
+    """
+    chain = [v.strip() for v in get_vendor("crypto_derivatives", "get_crypto_derivatives").split(",")]
+    explicit = [v for v in chain if v and v != "default"]
+    return (not explicit or "agentfeed" in explicit) and agentfeed_is_configured()
 
 
 def vendor_unavailable(method: str, error: Exception) -> str:
