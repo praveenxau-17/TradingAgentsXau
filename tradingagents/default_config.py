@@ -88,6 +88,19 @@ def build_default_config() -> dict:
         # the oldest resolved entries are pruned once this limit is exceeded.
         # Pending entries are never pruned. None disables rotation entirely.
         "memory_log_max_entries": None,
+        # Optional real-portfolio file (realized P&L attribution). Manually
+        # maintained CSV, one row per position (open or closed); closed rows
+        # (close_date + close_price filled in) have their realized return
+        # recorded to the memory log on the next run — the ground truth,
+        # preferred over the horizon windows for calibration. path=None
+        # disables realized-P&L capture (pure paper-trading / research mode).
+        # Template: ~/.tradingagents/portfolio.csv (see memory/realized.py).
+        "portfolio": {
+            "path": "~/.tradingagents/portfolio.csv",
+            "format": "csv",          # csv | json | text (csv implemented)
+            "currency": "EUR",
+            "benchmark_ticker": None,  # e.g. "^GDAXI" (DAX) for realized alpha
+        },
         # LLM settings
         "llm_provider": "openai",
         "deep_think_llm": "gpt-6-sol",
@@ -178,6 +191,12 @@ def build_default_config() -> dict:
         # Trading days after the analysis date over which a decision's outcome is
         # measured, for reflection and for the backtest figures.
         "holding_period_days": 5,
+        # Multi-horizon evaluation windows (trading days after the analysis
+        # date), scored per decision. The FIRST entry is the anchor (the fast
+        # signal and the horizon the resolved tag reflects); later windows show
+        # how the call aged over longer horizons. Set to None to fall back to
+        # the single legacy window [holding_period_days].
+        "evaluation_horizons": [5, 21, 63, 126],
         "benchmark_ticker": None,
         "benchmark_map": {
             ".NS":  "^NSEI",       # NSE India (Nifty 50)

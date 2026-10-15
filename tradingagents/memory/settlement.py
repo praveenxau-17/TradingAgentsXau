@@ -2,8 +2,10 @@
 it against its benchmark and record a reflection on it in the memory log."""
 
 import logging
+import os
+import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.market import get_closes
@@ -33,6 +35,38 @@ def resolve_benchmark(ticker: str, config: dict) -> str:
         if suffix and ticker_upper.endswith(suffix.upper()):
             return benchmark
     return benchmark_map.get("", "SPY")
+
+
+def get_evaluation_horizons(config: dict) -> list[int]:
+    """The configured multi-horizon evaluation windows (trading days), smallest
+    first. The first window is the anchor (fast signal + the horizon the resolved
+    tag reflects).
+
+    Configurable, in priority order (first match wins):
+    1. ``TRADINGAGENTS_EVALUATION_HORIZONS`` env var — comma/semicolon-separated
+       trading-day counts (e.g. ``"5,21,63,126"`` or ``"10;40"``); a per-run
+       override that needs no code change.
+    2. ``config["evaluation_horizons"]`` — list of trading-day counts.
+    3. Legacy fallback ``[config["holding_period_days"]]`` (single 5d window).
+
+    Values <= 0 are dropped; at least one window always survives (else 5).
+    """
+    env = os.environ.get("TRADINGAGENTS_EVALUATION_HORIZONS", "").strip()
+    if env:
+        parsed = [
+            int(x)
+            for x in re.split(r"[,;]+", env)
+            if x.strip().lstrip("-").isdigit()
+        ]
+        windows = sorted(x for x in parsed if x > 0)
+        if windows:
+            return windows
+    h = config.get("evaluation_horizons")
+    if h:
+        windows = sorted(int(x) for x in h if int(x) > 0)
+        if windows:
+            return windows
+    return [int(config.get("holding_period_days", 5))]
 
 
 def _by_day(closes):
@@ -98,6 +132,36 @@ def fetch_returns(
     return raw, alpha, holding_days, resolution_date
 
 
+def _window_can_be_closed(trade_date: str, holding_days: int, today: str) -> bool:
+    """Cheap date guard: can the window even have fully traded by ``today``?
+    h trading days span at least ~7/5 * h calendar days, so a window whose
+    calendar span has not elapsed is skipped without a price fetch."""
+    start = datetime.strptime(trade_date, "%Y-%m-%d")
+    now = datetime.strptime(today, "%Y-%m-%d")
+    return (now - start).days >= (holding_days * 7) // 5
+
+
+def fetch_horizons(
+    ticker: str, trade_date: str, horizons: list[int],
+    benchmark: str = "SPY",
+) -> dict[int, tuple[float | None, float | None, int | None, str | None]]:
+    """Per-horizon returns for the windows whose span has traded.
+
+    Returns ``{horizon: (raw, alpha, days, resolution) or (None,)*4}``; a horizon
+    whose full window has not traded yet maps to all-None. Windows that cannot
+    yet be closed are skipped without a price fetch (cheap date guard), so a
+    multi-horizon pass stays light while most windows are still in the future.
+    """
+    today = date.today().isoformat()
+    out: dict[int, tuple[float | None, float | None, int | None, str | None]] = {}
+    for h in horizons:
+        if not _window_can_be_closed(trade_date, h, today):
+            out[h] = (None, None, None, None)
+            continue
+        out[h] = fetch_returns(ticker, trade_date, h, benchmark=benchmark)
+    return out
+
+
 @dataclass
 class Settlement:
     """What a settlement pass did: the decisions it settled and those it could not."""
@@ -107,62 +171,134 @@ class Settlement:
 
 
 def settle_pending(ticker: str, memory_log, reflector, config: dict, wait: bool = True) -> Settlement:
-    """Settle ``ticker``'s pending decisions whose holding window has traded.
+    """Settle ``ticker``'s decisions across the configured multi-horizon windows.
 
-    One pass at a time per log (``memory_log.settling()``), so runs sharing a log
-    never pay for the same reflection twice. Each outcome is written as soon as
-    its reflection is done, so an interrupted pass keeps what it finished.
-    Entries whose window has not traded yet are skipped; an entry whose prices
-    or reflection could not be had stays pending and is reported as failed.
+    Two phases, per entry:
+    * Still-pending entries finalise once the *anchor* (smallest) window has
+      traded and its multi-horizon lesson is generated; if the reflection call
+      fails the entry stays pending and is retried on the next pass.
+    * Resolved entries keep accumulating the longer windows as they close, and
+      the stored lesson is *refreshed* to cover each newly measured window —
+      this evolving multi-horizon lesson is what replaces the old single-anchor
+      (5d) reflection. Numbers are recorded even if a refresh fails (retried).
+
+    One pass at a time per log (``memory_log.settling()``). Windows that have
+    not traded yet are skipped via a cheap date guard (no price fetch). An
+    entry whose prices could not be had stays pending and is reported as failed.
     With ``wait=False`` a pass already running elsewhere is left to do the work.
     """
     result = Settlement()
     with memory_log.settling(wait=wait) as held:
         if not held:
             return result
-        pending = [e for e in memory_log.get_pending_entries() if e["ticker"] == ticker]
-        if not pending:
+        horizons = get_evaluation_horizons(config)
+        anchor = horizons[0]
+        todo = [e for e in memory_log.get_entries_needing_settlement(horizons) if e["ticker"] == ticker]
+        if not todo:
             return result
         benchmark = resolve_benchmark(ticker, config)
-        for entry in pending:
-            try:
-                raw, alpha, days, resolution_date = fetch_returns(
-                    ticker, entry["date"], config.get("holding_period_days", 5), benchmark=benchmark,
-                )
-            except Exception as exc:
-                logger.warning("Prices for settling %s on %s were unavailable: %s", ticker, entry["date"], exc)
-                result.failed.append((ticker, entry["date"], f"prices unavailable: {exc}"))
+        for entry in todo:
+            hz = entry.get("horizons") or {}
+            scored = {
+                h: v for h, v in hz.items()
+                if isinstance(v, dict) and v.get("alpha") is not None
+            }
+            covers = set(entry.get("reflection_covers") or [])
+            missing = [h for h in horizons if h not in hz]
+
+            if entry["pending"]:
+                # Phase 1: the anchor must trade out and its lesson must succeed.
+                if not missing:
+                    continue
+                try:
+                    results = fetch_horizons(ticker, entry["date"], missing, benchmark=benchmark)
+                except Exception as exc:
+                    logger.warning("Prices for settling %s on %s were unavailable: %s", ticker, entry["date"], exc)
+                    result.failed.append((ticker, entry["date"], f"prices unavailable: {exc}"))
+                    continue
+                new = {h: r for h, r in results.items() if r[0] is not None}
+                if anchor not in new:
+                    continue  # anchor window hasn't fully traded yet
+                new_dicts = {h: {"raw": r[0], "alpha": r[1], "resolution": r[3]}
+                             for h, r in new.items()}
+                scored_now = {**scored, **new_dicts}
+                try:
+                    reflection = reflector.reflect_on_final_decision(
+                        final_decision=entry.get("decision", ""),
+                        settled=scored_now,
+                        configured=horizons,
+                        benchmark_name=benchmark,
+                    )
+                except Exception as exc:
+                    # Reflection calls a provider: a transient failure leaves the
+                    # entry pending for the next pass rather than stopping the analysis.
+                    logger.warning("Multi-horizon reflection failed for %s on %s: %s", ticker, entry["date"], exc)
+                    result.failed.append((ticker, entry["date"], f"reflection failed: {exc}"))
+                    continue
+                anchor_res = new[anchor][3]
+                if memory_log.merge_horizons(
+                    ticker, entry["date"], new, reflection,
+                    anchor_days=anchor, resolution_date=anchor_res,
+                    reflection_covers=sorted(scored_now),
+                ):
+                    result.settled.append((ticker, entry["date"]))
                 continue
-            if raw is None:
-                continue  # the holding window has not traded yet: try again next run
-            try:
-                reflection = reflector.reflect_on_final_decision(
-                    final_decision=entry.get("decision", ""),
-                    raw_return=raw,
-                    alpha_return=alpha,
-                    benchmark_name=benchmark,
-                    holding_days=days,
-                )
-            except Exception as exc:
-                # Reflection calls a provider: a transient failure leaves the entry
-                # pending for the next pass rather than stopping the analysis.
-                logger.warning("Reflection failed for %s on %s: %s", ticker, entry["date"], exc)
-                result.failed.append((ticker, entry["date"], f"reflection failed: {exc}"))
+
+            # Phase 2: resolved — accumulate new windows + refresh the lesson.
+            reflection_stale = (anchor in scored) and bool(set(scored) - covers)
+            if not missing and not reflection_stale:
                 continue
-            if memory_log.update_with_outcome(ticker, entry["date"], raw, alpha, days, reflection,
-                                              resolution_date=resolution_date):
+            new = {}
+            if missing:
+                try:
+                    results = fetch_horizons(ticker, entry["date"], missing, benchmark=benchmark)
+                except Exception as exc:
+                    logger.warning("Prices for settling %s on %s were unavailable: %s", ticker, entry["date"], exc)
+                    result.failed.append((ticker, entry["date"], f"prices unavailable: {exc}"))
+                    continue
+                new = {h: r for h, r in results.items() if r[0] is not None}
+            new_dicts = {h: {"raw": r[0], "alpha": r[1], "resolution": r[3]}
+                         for h, r in new.items()}
+            scored_now = {**scored, **new_dicts}
+            needs_refresh = bool(set(scored_now) - covers)
+            reflection = None
+            reflection_ok = True
+            if needs_refresh:
+                try:
+                    reflection = reflector.reflect_on_final_decision(
+                        final_decision=entry.get("decision", ""),
+                        settled=scored_now,
+                        configured=horizons,
+                        benchmark_name=benchmark,
+                    )
+                except Exception as exc:
+                    logger.warning("Multi-horizon reflection refresh failed for %s on %s: %s", ticker, entry["date"], exc)
+                    reflection_ok = False
+            if not new and not needs_refresh:
+                continue  # nothing new to record and the lesson is current
+            anchor_res = new.get(anchor, (None, None, None, None))[3]
+            if memory_log.merge_horizons(
+                ticker, entry["date"], new, reflection,
+                anchor_days=None, resolution_date=anchor_res,
+                reflection_covers=sorted(scored_now) if (needs_refresh and reflection_ok) else None,
+            ):
                 result.settled.append((ticker, entry["date"]))
+            if needs_refresh and not reflection_ok:
+                result.failed.append((ticker, entry["date"], "multi-horizon reflection refresh deferred; numbers recorded"))
     return result
 
 
 def settle_all_pending(memory_log, reflector, config: dict, wait: bool = True) -> Settlement:
-    """Settle every ticker's pending decisions whose holding window has traded (#1445).
+    """Settle every ticker's decisions whose evaluation windows have traded.
 
-    A run settles its own ticker; a ticker no longer analysed would otherwise
-    keep its decisions pending, and their lessons out of later runs.
+    Covers both still-pending entries and resolved ones that have not yet
+    accumulated their longer horizons (#1445). A run settles its own ticker; a
+    ticker no longer analysed would otherwise keep its decisions from
+    completing, and their lessons out of later runs.
     """
     result = Settlement()
-    for ticker in dict.fromkeys(e["ticker"] for e in memory_log.get_pending_entries()):
+    horizons = get_evaluation_horizons(config)
+    for ticker in dict.fromkeys(e["ticker"] for e in memory_log.get_entries_needing_settlement(horizons)):
         done = settle_pending(ticker, memory_log, reflector, config, wait=wait)
         result.settled.extend(done.settled)
         result.failed.extend(done.failed)
